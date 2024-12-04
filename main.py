@@ -16,6 +16,10 @@ arglist = arguments.parse_args()
 
 # 设置环境名称
 arglist.env_name = 'Pong-v4'#'Breakout-v4'  # 或 'Pong-v4'
+rng = np.random.default_rng(0)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+min=16
+max =64
 
 # 环境初始化
 rng = np.random.default_rng(0)

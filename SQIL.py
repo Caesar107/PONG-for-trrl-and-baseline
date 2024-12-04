@@ -54,7 +54,10 @@ class NullLogger(logging.Logger):
 
 # 创建空日志记录器实例
 null_logger = NullLogger(name="null")
-
+rng = np.random.default_rng(0)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+min=16
+max =64
 
 
 arglist = arguments.parse_args()
