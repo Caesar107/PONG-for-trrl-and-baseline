@@ -77,9 +77,15 @@ To run specific baseline algorithms, use the corresponding script:
 
 All scripts are configured to use the `Pong` environment by default.
 
----
+### Running All Experiments
 
-## Baselines
+To run all the experiments (TRRL and baselines), simply execute the following script:
+
+```bash
+python run_experiments.py
+```
+
+### Baselines
 
 The repository includes several baseline algorithms for comparison:
 - **AIRL**: Adversarial approach for inverse reinforcement learning.
