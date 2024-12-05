@@ -21,7 +21,10 @@ logger.handlers = []
 # Parse arguments
 arglist = arguments.parse_args()
 rng = np.random.default_rng(0)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Force device to CPU (this avoids using GPU even if CUDA is available)
+device = torch.device("cpu")
+
 min_batch_size = 16
 
 def compute_kl_divergence(expert_policy, current_policy, observations, actions, device):
@@ -141,7 +144,10 @@ bc_trainer = BC(
 
 print("Starting Behavioral Cloning training.")
 
-# Define a class to manage logging context for BC training
+# Define total training timesteps
+total_timesteps = 10000  # Same as AIRL
+
+# Modify the BCLogger class to use total_timesteps-based rounds
 class BCLogger:
     def __init__(self, writer, expert, bc_trainer, env, transitions, device):
         self.writer = writer
@@ -150,7 +156,7 @@ class BCLogger:
         self.env = env
         self.transitions = transitions
         self.device = device
-        self.epoch_idx = 0  # Initialize epoch index
+        self.timestep_idx = 0  # Initialize timestep index
 
     def on_epoch_end(self):
         """Log metrics at the end of each epoch."""
@@ -161,24 +167,24 @@ class BCLogger:
         kl_div = compute_kl_divergence(self.expert, self.bc_trainer.policy, obs, acts, self.device)
         mean_reward, _ = evaluate_policy(model=self.bc_trainer.policy, env=self.env, n_eval_episodes=10)
 
-        # Log to TensorBoard
-        self.writer.add_scalar("Valid/distance", kl_div, self.epoch_idx)
-        self.writer.add_scalar("Valid/reward", mean_reward, self.epoch_idx)
+        # Log to TensorBoard using timestep_idx
+        self.writer.add_scalar("Valid/distance", kl_div, self.timestep_idx)
+        self.writer.add_scalar("Valid/reward", mean_reward, self.timestep_idx)
 
         # Print log
-        print(f"Epoch {self.epoch_idx}: KL Divergence = {kl_div:.4f}, Reward = {mean_reward:.4f}")
-        self.epoch_idx += 1  # Increment epoch index
+        print(f"Timestep {self.timestep_idx}: KL Divergence = {kl_div:.4f}, Reward = {mean_reward:.4f}")
 
-# Instantiate the logger
+        # Increment timestep index (based on training progress)
+        self.timestep_idx += total_timesteps // 625  # Adjust according to number of epochs
+
+# Instantiate the logger with total timesteps logic
 bc_logger = BCLogger(writer, expert, bc_trainer, env, transitions, device)
 
-# Start training
+# Train BC with adjusted logger
 bc_trainer.train(
     n_epochs=625,  # Number of epochs to train
-    on_epoch_end=bc_logger.on_epoch_end,  # Pass the logging method
+    on_epoch_end=bc_logger.on_epoch_end,  # Pass the modified logging method
 )
 
-# Close TensorBoard writer
-writer.close()
 
 
