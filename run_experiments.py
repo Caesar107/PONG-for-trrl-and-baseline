@@ -40,12 +40,13 @@ def main():
 
     # List of scripts to run
     scripts = [
-        "main.py",  # TRRL method
+        
         "AIRL.py",  # Adversarial Inverse Reinforcement Learning
         "GAIL.py",  # Generative Adversarial Imitation Learning
         "BC.py",    # Behavior Cloning
         "Daggle.py",  # Daggle baseline
         "SQIL.py"   # Soft Q Imitation Learning
+        "main.py",  # TRRL method
     ]
 
     # Run each script
