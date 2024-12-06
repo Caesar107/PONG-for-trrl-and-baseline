@@ -33,7 +33,7 @@ import torch.utils.tensorboard as tb
 from imitation.algorithms.sqil import SQIL
 # from sqil import SQIL
 from trrl import TRRL
-from BC import BC
+#from BC import BC
 from typing import (
     List,
 )
@@ -55,14 +55,14 @@ class NullLogger(logging.Logger):
 # 创建空日志记录器实例
 null_logger = NullLogger(name="null")
 rng = np.random.default_rng(0)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu")
 min=16
+rng = np.random.default_rng(0)
 max =64
 
 
 arglist = arguments.parse_args()
 
-rng = np.random.default_rng(arglist.seed)
 env = VecTransposeImage(make_vec_env(
     arglist.env_name,
     n_envs=arglist.n_env,
