@@ -12,11 +12,14 @@ import numpy as np
 import gymnasium as gym
 from functools import wraps
 from stable_baselines3.common.evaluation import evaluate_policy
+import datetime
+from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage
+
 
 from stable_baselines3 import PPO
 from stable_baselines3.ppo import MlpPolicy
 from stable_baselines3.common import policies, vec_env, evaluation, preprocessing
-from stable_baselines3.common.vec_env import VecTransposeImage
+
 from imitation.algorithms import base as algo_base
 from imitation.algorithms import base
 from imitation.data import types
@@ -38,9 +41,26 @@ def timeit_decorator(func):
         result = func(*args, **kwargs)
         end_time = time.time()
         temp_str = str(func.__code__)
-        #print(f"Function {temp_str[-30:]} {func.__name__}  executed in {end_time - start_time} seconds")
+        # print(f"Function {temp_str[-30:]} {func.__name__}  executed in {end_time - start_time} seconds")
         return result
+
     return wrapper
+
+
+class CustomResetEnv(gym.Env):
+    def __init__(self, env):
+        self.env = env
+
+    def reset(self, custom_state=None):
+        obs = self.env.reset()
+        if custom_state is not None:
+            self.env.state = custom_state  # 设置自定义状态
+            obs = self.env._get_obs()  # 调用环境的观测生成函数
+        return obs
+
+    def step(self, action):
+        return self.env.step(action)
+
 
 class TRRL(algo_base.DemonstrationAlgorithm[types.Transitions]):
     """Trust Region Reward Learning (TRRL).
@@ -49,28 +69,29 @@ class TRRL(algo_base.DemonstrationAlgorithm[types.Transitions]):
     """
 
     def __init__(
-        self,
-        *,
-        venv: vec_env.VecEnv,
-        expert_policy: policies = None,
-        demonstrations: base.AnyTransitions,
-        demo_batch_size: int,
-        custom_logger: Optional[logger.HierarchicalLogger] = None,
-        reward_net: RewardNet,
-        discount: np.float32,
-        avg_diff_coef: np.float32,
-        l2_norm_coef: np.float32,
-        l2_norm_upper_bound: np.float32,
-        ent_coef: np.float32 = 0.01,
-        rwd_opt_cls: Type[torch.optim.Optimizer] = torch.optim.Adam,
-        device: torch.device = torch.device("cpu"),
-        log_dir: types.AnyPath = "output/",
-        allow_variable_horizon: bool = False,
-        n_policy_updates_per_round=100_000,
-        n_reward_updates_per_round=10,
-        n_episodes_adv_fn_est=32,
-        n_timesteps_adv_fn_est=64,
-        **kwargs,
+            self,
+            *,
+            venv: vec_env.VecEnv,
+            expert_policy: policies = None,
+            demonstrations: base.AnyTransitions,
+            demo_batch_size: int,
+            custom_logger: Optional[logger.HierarchicalLogger] = None,
+            reward_net: RewardNet,
+            discount: np.float32,
+            t_kl:np.float32,
+            avg_diff_coef: np.float32,
+            l2_norm_coef: np.float32,
+            l2_norm_upper_bound: np.float32,
+            ent_coef: np.float32 = 0.01,
+            rwd_opt_cls: Type[torch.optim.Optimizer] = torch.optim.Adam,
+            device: torch.device = torch.device("cpu"),
+            log_dir: types.AnyPath = "output/",
+            allow_variable_horizon: bool = False,
+            n_policy_updates_per_round=100_000,
+            n_reward_updates_per_round=10,
+            n_episodes_adv_fn_est=32,
+            n_timesteps_adv_fn_est=64,
+            **kwargs,
     ):
         """
         Builds TRRL.
@@ -108,49 +129,50 @@ class TRRL(algo_base.DemonstrationAlgorithm[types.Transitions]):
         self.avg_diff_coef = avg_diff_coef
         self.l2_norm_coef = l2_norm_coef
         self.l2_norm_upper_bound = l2_norm_upper_bound
-        #self.expert_state_action_density = self.est_expert_demo_state_action_density(demonstrations)
+        self.t_kl = t_kl
+        # self.expert_state_action_density = self.est_expert_demo_state_action_density(demonstrations)
         self.venv = venv
         self.device = device
         self._expert_policy = expert_policy
-        self.demonstrations=demonstrations
-        self.demo_batch_size=demo_batch_size
+        self.demonstrations = demonstrations
+        self.demo_batch_size = demo_batch_size
         super().__init__(
             demonstrations=demonstrations,
             custom_logger=custom_logger,
             allow_variable_horizon=allow_variable_horizon,
         )
-        self.venv=venv
+        self.venv = venv
         self._new_policy = None  # Initialize _new_policy
-        self._reward_net=reward_net.to(device)
+        self._reward_net = reward_net.to(device)
         self._rwd_opt = self._rwd_opt_cls(self._reward_net.parameters(), lr=0.0005)
-        self.discount=discount
+        self.discount = discount
         self.n_policy_updates_per_round = n_policy_updates_per_round
         self.n_reward_updates_per_round = n_reward_updates_per_round
         self.n_episodes_adv_fn_est = n_episodes_adv_fn_est
         self.n_timesteps_adv_fn_est = n_timesteps_adv_fn_est
         self._log_dir = util.parse_path(log_dir)
-        #self.logger = logger.configure(self._log_dir)
+        # self.logger = logger.configure(self._log_dir)
         self._global_step = 0
-        self.MAX_BUFFER_SIZE = 1000  # define the maximum buffer value
-        self.trajectory_buffer = []  # initialize the buffer
-        self.current_iteration = 0  # Current policy iteration number
-        self.recent_policy_window = 5  # Sample only from the last 5 strategy-generated trajectories
+        self.MAX_BUFFER_SIZE = 1000  # 定义缓冲区最大值
+        self.trajectory_buffer = []  # 初始化缓冲区
+        self.current_iteration = 0  # 当前策略迭代次数
+        self.recent_policy_window = 5  # 只从最近5个策略生成的轨迹中采样
 
     def store_trajectory(self, trajectory):
-        """Store the trajectory and associate it with the number of iterations of the current policy"""
+        """存储轨迹，并将它与当前策略的迭代次数相关联"""
         if len(self.trajectory_buffer) >= self.MAX_BUFFER_SIZE:
-            self.trajectory_buffer.pop(0)  # remove early one
-        self.trajectory_buffer.append((trajectory, self.current_iteration))  #storage trajectories and corresponding strategy iterations
+            self.trajectory_buffer.pop(0)  # 移除最早的轨迹
+        self.trajectory_buffer.append((trajectory, self.current_iteration))  # 存储轨迹和对应的策略迭代次数
 
     def sample_old_trajectory(self):
-        """Sampling only from trajectories generated by the most recent strategy"""
+        """只从最近策略生成的轨迹中进行采样"""
         recent_trajectories = [
             traj for traj, iteration in self.trajectory_buffer
             if iteration >= self.current_iteration - self.recent_policy_window
         ]
         if len(recent_trajectories) == 0:
-            raise ValueError("Not enough recent trajectories to sample")
-        return random.choice(recent_trajectories) 
+            raise ValueError("没有足够的最近轨迹可供采样")
+        return random.choice(recent_trajectories)
 
     @property
     @timeit_decorator
@@ -165,11 +187,11 @@ class TRRL(algo_base.DemonstrationAlgorithm[types.Transitions]):
         assert isinstance(self._expert_policy.policy, policies.ActorCriticPolicy)
         obs = copy.deepcopy(self.demonstrations.obs)
         acts = copy.deepcopy(self.demonstrations.acts)
-        
+
         obs_th = torch.as_tensor(obs, device=self.device)
         acts_th = torch.as_tensor(acts, device=self.device)
 
-        # Ensure model weights are on the same device
+        # 确保模型的权重在同一设备上
         self._old_policy.policy.to(self.device)
         self._expert_policy.policy.to(self.device)
         # print(obs_th.shape)
@@ -180,8 +202,8 @@ class TRRL(algo_base.DemonstrationAlgorithm[types.Transitions]):
 
         kl_div = torch.mean(torch.dot(torch.exp(target_log_prob), target_log_prob - input_log_prob))
 
-        return(float(kl_div))
-    
+        return (float(kl_div))
+
     @property
     def evaluate_policy(self) -> float:
         """Evalute the true expected return of the learned policy under the original environment.
@@ -217,6 +239,7 @@ class TRRL(algo_base.DemonstrationAlgorithm[types.Transitions]):
     def est_expert_demo_state_action_density(self, demonstration: base.AnyTransitions) -> np.ndarray:
         pass
 
+    #############################################################################################
     def compute_is_weights(self, old_policy, new_policy, observations, actions):
         """
         Compute the importance sampling (IS) weights.
@@ -233,17 +256,20 @@ class TRRL(algo_base.DemonstrationAlgorithm[types.Transitions]):
         observations = torch.as_tensor(observations, device=self.device)
         actions = torch.as_tensor(actions, device=self.device)
 
-        # Ensure model weights are on the same device
+        # 确保模型的权重在同一设备上
         self._old_policy.policy.to(self.device)
         self._expert_policy.policy.to(self.device)
 
+        ############################test
+
+        # 打印形状
         # print("Observations shape:", observations.shape)
         # print("Actions shape:", actions.shape)
 
         # observations = observations.to(self.device)
         # actions = actions.to(self.device)
-        #old_prob = old_policy.policy.get_distribution(observations).log_prob(actions)
-        #new_prob = new_policy.policy.get_distribution(observations).log_prob(actions)
+        # old_prob = old_policy.policy.get_distribution(observations).log_prob(actions)
+        # new_prob = new_policy.policy.get_distribution(observations).log_prob(actions)
 
         old_prob = old_policy.policy.evaluate_actions(observations, actions)[1]
         new_prob = new_policy.policy.evaluate_actions(observations, actions)[1]
@@ -254,9 +280,11 @@ class TRRL(algo_base.DemonstrationAlgorithm[types.Transitions]):
         weights = torch.exp(new_prob - old_prob)
         return weights
 
-    @timeit_decorator
+    ########################################################################
+
+    # @timeit_decorator
     def est_adv_fn_old_policy_cur_reward(self, starting_state: np.ndarray, starting_action: np.ndarray,
-                                        n_timesteps: int, n_episodes: int, use_mc=False) -> torch.Tensor:
+                                         n_timesteps: int, n_episodes: int, use_mc=False) -> torch.Tensor:
         """Use Monte-Carlo or Importance Sampling to estimate the advantage function of the given state and action under the
         old policy and the current reward network
 
@@ -274,11 +302,13 @@ class TRRL(algo_base.DemonstrationAlgorithm[types.Transitions]):
         """
         rng = np.random.default_rng(0)
 
+        # TODO 这里用的是不带新Reward的env?
         env = VecTransposeImage(make_vec_env(
-                env_name=self.venv.unwrapped.envs[0].unwrapped.spec.id,
-                n_envs=self.venv.num_envs,
-                rng=rng,
-                            ))
+            env_name=self.venv.unwrapped.envs[0].unwrapped.spec.id,
+            n_envs=self.venv.num_envs,
+            rng=rng,
+        )
+        )
 
         if isinstance(self.venv.unwrapped.envs[0].unwrapped.action_space, gym.spaces.Discrete):
             starting_a = starting_action.astype(int)
@@ -303,22 +333,29 @@ class TRRL(algo_base.DemonstrationAlgorithm[types.Transitions]):
                     starting_action=starting_a,
                     truncate=True,
                 )
+                # tran = rollout.generate_transitions(
+                #     self._old_policy,
+                #     env,
+                #     rng=rng,
+                #     n_timesteps=n_timesteps,
+                #     #starting_state=starting_s,
+                #     #starting_action=starting_a,
+                #     truncate=True,
+                # )
                 self.store_trajectory(tran)  # Store the new trajectory in buffer
             else:
                 # Importance Sampling: Sample an old trajectory from the buffer
                 tran = self.sample_old_trajectory()
                 # After applying IS, treat the new weighted trajectory as a new one and store it
-                self.store_trajectory(tran)  # Re-add IS-treated trajectories to the pool
-            state_th, action_th, next_state_th, done_th = self._reward_net.preprocess(tran.obs, tran.acts, tran.next_obs, tran.dones)
+                self.store_trajectory(tran)  # 将经过 IS 处理后的轨迹重新加入池子
+            state_th, action_th, next_state_th, done_th = self._reward_net.preprocess(tran.obs, tran.acts,
+                                                                                      tran.next_obs, tran.dones)
 
-            # Ensure tensors are on the correct device
-            state_th = state_th.to(self.device)
-            action_th = action_th.to(self.device)
-            next_state_th = next_state_th.to(self.device)
-            done_th = done_th.to(self.device)
-
+            state_th, action_th, next_state_th, done_th = self._reward_net.preprocess(tran.obs, tran.acts,
+                                                                                      tran.next_obs, tran.dones)
             rwds = self._reward_net(state_th, action_th, next_state_th, done_th)
-            discounts = torch.pow(torch.ones(n_timesteps, device=self.device)*self.discount, torch.arange(0, n_timesteps, device=self.device))
+            discounts = torch.pow(torch.ones(n_timesteps, device=self.device) * self.discount,
+                                  torch.arange(0, n_timesteps, device=self.device))
 
             if use_mc:
                 # Use Monte Carlo estimation
@@ -330,7 +367,25 @@ class TRRL(algo_base.DemonstrationAlgorithm[types.Transitions]):
 
         # The v calculation remains unchanged
         v = torch.zeros(1).to(self.device)
-
+        '''
+        if isinstance(self.venv.unwrapped.envs[0].unwrapped.action_space, gym.spaces.Discrete):
+            # if the action space is discrete, then V(s,a) can be calculated as the expectation of Q(s,a) over all a's 
+            state_th = util.safe_to_tensor(starting_state).to(self.device)
+            state_th = cast(
+                torch.Tensor,
+                preprocessing.preprocess_obs(
+                    state_th,
+                    self.venv.unwrapped.envs[0].unwrapped.observation_space,
+                    True,
+                ),
+            )
+            with torch.no_grad():
+                self._old_policy.policy.forward(obs=torch.as_tensor(state_th, device=self.device))
+                PPO.policy.for
+            pass
+            # if the action space is fully or partially continuous, then V(s,a) is approximated by Monte Carlo simulation.
+        '''
+        j = 0
         for ep_idx in range(n_episodes):
             tran = rollouts.generate_transitions(
                 self._old_policy,
@@ -341,8 +396,18 @@ class TRRL(algo_base.DemonstrationAlgorithm[types.Transitions]):
                 starting_action=None,
                 truncate=True,
             )
-
-            state_th, action_th, next_state_th, done_th = self._reward_net.preprocess(tran.obs, tran.acts, tran.next_obs, tran.dones)
+            #
+            # tran = rollout.generate_transitions(
+            #     self._old_policy,
+            #     env,
+            #     n_timesteps=n_timesteps,
+            #     rng=rng,
+            #     #starting_state=starting_s,
+            #     #starting_action=None,
+            #     truncate=True,
+            # )
+            state_th, action_th, next_state_th, done_th = self._reward_net.preprocess(tran.obs, tran.acts,
+                                                                                      tran.next_obs, tran.dones)
 
             # Ensure tensors are on the correct device
             state_th = state_th.to(self.device)
@@ -351,7 +416,8 @@ class TRRL(algo_base.DemonstrationAlgorithm[types.Transitions]):
             done_th = done_th.to(self.device)
 
             rwds = self._reward_net(state_th, action_th, next_state_th, done_th)
-            discounts = torch.pow(torch.ones(n_timesteps, device=self.device)*self.discount, torch.arange(0, n_timesteps, device=self.device))
+            discounts = torch.pow(torch.ones(n_timesteps, device=self.device) * self.discount,
+                                  torch.arange(0, n_timesteps, device=self.device))
 
             if use_mc:
                 v += torch.dot(rwds, discounts)
@@ -360,9 +426,7 @@ class TRRL(algo_base.DemonstrationAlgorithm[types.Transitions]):
                 v += torch.dot(weights * rwds, discounts)
 
         env.close()
-        return (q-v)/n_episodes
-
-
+        return (q - v) / n_episodes
 
     @timeit_decorator
     def train_new_policy_for_new_reward(self) -> policies.BasePolicy:
@@ -376,7 +440,8 @@ class TRRL(algo_base.DemonstrationAlgorithm[types.Transitions]):
             env_name=self.venv.unwrapped.envs[0].unwrapped.spec.id,
             n_envs=self.venv.num_envs,
             rng=rng,
-        ))
+        )
+        )
 
         # setup an env with the reward being the current reward network
         rwd_fn = RwdFromRwdNet(rwd_net=self._reward_net)
@@ -402,18 +467,17 @@ class TRRL(algo_base.DemonstrationAlgorithm[types.Transitions]):
 
         venv_with_cur_rwd_net.close()
         venv.close()
-        
+
         # Store the new policy
         self._new_policy = new_policy
 
-         # updaate iteration after training policy
+        # 在策略训练完成后，更新策略迭代次数
         self.current_iteration += 1
 
         return new_policy
 
-
     @timeit_decorator
-    def update_reward(self,use_mc=False):
+    def update_reward(self, use_mc=False):
         """Perform a single reward update by conducting a complete pass over the demonstrations, 
         optionally using provided samples. The loss is adapted from the constrained optimisation 
         problem of the trust region reward learning by Lagrangian multipliers (moving the constraints 
@@ -429,57 +493,104 @@ class TRRL(algo_base.DemonstrationAlgorithm[types.Transitions]):
         # initialise the optimiser for the reward net
         # Do a complete pass on the demonstrations, i.e., sampling sufficient batches for performing GD.
         batch_iter = self._make_reward_train_batches()
+
         for batch in batch_iter:
+
+            start_batch = time.time()
             # estimate the advantage function
             obs = batch["state"]
             acts = batch["action"]
             next_obs = batch["next_state"]
             dones = batch["done"]
-            
+
             loss = torch.zeros(1).to(self.device)
 
             # estimated average estimated advantage function values
             cumul_advantages = torch.zeros(1).to(self.device)
 
             for idx in range(obs.shape[0]):
-                cumul_advantages += self.est_adv_fn_old_policy_cur_reward(starting_state=obs[idx], 
-                                                              starting_action=acts[idx], 
-                                                              n_timesteps=self.n_timesteps_adv_fn_est, 
-                                                              n_episodes=self.n_episodes_adv_fn_est,
-                                                              use_mc=use_mc)
-                
-            avg_advantages = cumul_advantages / obs.shape[0]
-            #print("Advantage estimation finished.")
+                cumul_advantages += self.est_adv_fn_old_policy_cur_reward(starting_state=obs[idx],
+                                                                          starting_action=acts[idx],
+                                                                          n_timesteps=self.n_timesteps_adv_fn_est,
+                                                                          n_episodes=self.n_episodes_adv_fn_est,
+                                                                          use_mc=use_mc)
 
+            avg_advantages = cumul_advantages / obs.shape[0]
             state_th, action_th, next_state_th, done_th = self._reward_net.preprocess(obs, acts, next_obs, dones)
 
             if self._old_reward_net is None:
-                reward_diff = self._reward_net(state_th, action_th, next_state_th, done_th) - torch.ones(1).to(self.device)
+                reward_diff = self._reward_net(state_th, action_th, next_state_th, done_th) - torch.ones(1).to(
+                    self.device)
+                print("self._old_reward_net is None")
             else:
                 # use `predict_th` for `self._old_reward_net` as its gradient is not needed
-                reward_diff = self._reward_net(state_th, action_th, next_state_th, done_th) - self._old_reward_net.predict_th(obs, acts, next_obs, dones).to(self.device)
-            
+                # TODO: 第一轮迭代，diff=0，因为old和new RewardNet存的相同
+                reward_diff = self._reward_net(state_th, action_th, next_state_th,
+                                               done_th) - self._old_reward_net.predict_th(obs, acts, next_obs,
+                                                                                          dones).to(self.device)
+
+            # print("reward_diff:",reward_diff)
+
             # TODO: two penalties should be calculated over all state-action pairs
+            # 在所有的S-A上计算； S-A去重
             avg_reward_diff = torch.mean(reward_diff)
-            
             l2_norm_reward_diff = torch.norm(reward_diff, p=2)
-            
-            loss = avg_advantages + self.avg_diff_coef * avg_reward_diff - self.l2_norm_coef * l2_norm_reward_diff \
-                + self.l2_norm_upper_bound 
+
+            ####################################################################
+            #adaptive Lagrange multiplier
+            distance = self.expert_kl
+            t_kl= self.t_kl
+            print("\nThreshold is:", t_kl,"coef is:",self.avg_diff_coef)
+            if distance > self.t_kl * 1.5:
+                self.avg_diff_coef *= 1.2  # 增加 Lagrange 乘子系数
+            elif distance < self.t_kl / 1.5:
+                self.avg_diff_coef /= 1.2  # 减小 Lagrange 乘子系数
+
+            # Ensure avg_diff_coef is a tensor before applying clamp
+            self.avg_diff_coef = torch.tensor(self.avg_diff_coef)
+            self.avg_diff_coef = torch.clamp(self.avg_diff_coef, min=1e-5, max=1)
+
+            # 设定参考阈值与缩放因子（根据实际情况调整）
+            l2_norm_target_lower = 0.01     # 当l2_norm_reward_diff低于该值时，说明更新过于保守，可减少约束
+            l2_norm_target_upper = 1     # 当l2_norm_reward_diff高于该值时，说明更新过大，需要加强约束
+            scaling_factor_increase = 1.1   # 增大系数时的倍率
+            scaling_factor_decrease = 1.1   # 减小系数时的倍率
+
+            if l2_norm_reward_diff > l2_norm_target_upper:
+                # 更新幅度过大，需要加强约束
+                self.l2_norm_coef *= scaling_factor_increase
+            elif l2_norm_reward_diff < l2_norm_target_lower:
+                # 更新幅度过小，可能过于保守，适度放宽约束
+                self.l2_norm_coef /= scaling_factor_decrease
+
+            # 限制 l2_norm_coef 的范围，防止出现过大或过小的情况
+            self.l2_norm_coef = torch.tensor(self.l2_norm_coef)
+            self.l2_norm_coef = torch.clamp(self.l2_norm_coef, min=1e-5, max=1)
+
+            # 打印或记录当前状态，便于调试和观察
+            print(f"Current L2 diff: {l2_norm_reward_diff.item():.4f}, adjusted l2_norm_coef: {self.l2_norm_coef.item():.6f}")
+
+            ####################################################################
+            loss = avg_advantages + self.avg_diff_coef * avg_reward_diff - self.l2_norm_coef * l2_norm_reward_diff + self.l2_norm_upper_bound
+            print(self._global_step, "loss:", loss, "avg_advantages:", avg_advantages, "avg_reward_diff:",
+                  avg_reward_diff, "l2_norm_reward_diff:", l2_norm_reward_diff)
+
             loss = - loss * (self.demo_batch_size / self.demonstrations.obs.shape[0])
 
             self._rwd_opt.zero_grad()
             loss.backward()
             self._rwd_opt.step()
 
-             # recording to TensorBoard
             writer.add_scalar("Train/loss", loss.item(), self._global_step)
             writer.add_scalar("Train/avg_advantages", avg_advantages.item(), self._global_step)
             writer.add_scalar("Train/avg_reward_diff", avg_reward_diff.item(), self._global_step)
 
-        self._global_step += 1
+            end_batch = time.time()
+            print("batch time:", end_batch - start_batch)
 
-    @timeit_decorator
+            self._global_step += 1
+
+    # @timeit_decorator
     def train(self, n_rounds: int, callback: Optional[Callable[[int], None]] = None):
         """
         Args:
@@ -490,44 +601,67 @@ class TRRL(algo_base.DemonstrationAlgorithm[types.Transitions]):
         # TODO: Make the initial reward net oupput <= 1 
         # Iteratively train a reward function and the induced policy.
         global writer
-        writer = tb.SummaryWriter("logs/TRRL", flush_secs=1)
+        # 获取当前时间并格式化
+        current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # 创建带时间戳的日志目录，例如：logs/20231201_103000
+        log_dir = f"logs/{current_time}"
+
+        writer = tb.SummaryWriter(log_dir=log_dir, flush_secs=1)
+        #writer = tb.SummaryWriter('./logs/', flush_secs=1)
+
+        print("n_policy_updates_per_round:", self.n_policy_updates_per_round)
+        print("n_reward_updates_per_round:", self.n_reward_updates_per_round)
+
+        # 设置保存模型的轮数间隔
+        save_interval = 50  
 
         for r in tqdm.tqdm(range(0, n_rounds), desc="round"):
             # Update the policy as the one optimal for the updated reward.
+
             self._old_policy = self.train_new_policy_for_new_reward()
-            
+
             # Determine whether to use Monte Carlo or Importance Sampling
             use_mc = (r % 200 == 0)
-            
-            
+
             # Update the reward network.
             for _ in range(self.n_reward_updates_per_round):
+                #print("reward_updates_per_round is",self.n_reward_updates_per_round)################################
                 self.update_reward(use_mc=use_mc)
-            
+
             self._old_reward_net = copy.deepcopy(self._reward_net)
+            distance = self.expert_kl
+            reward = self.evaluate_policy
 
-            # recording to TensorBoard
-            writer.add_scalar("Valid/distance", self.expert_kl, r)
-            writer.add_scalar("Valid/reward", self.evaluate_policy, r)
+            writer.add_scalar("Valid/distance", distance, r)
+            writer.add_scalar("Valid/reward", reward, r)
 
-
-            self.logger.record("round " + str(r), 'Distance: '+str(self.expert_kl)+'. Reward: '+str(self.evaluate_policy))
+            self.logger.record("round " + str(r),
+                               'Distance: ' + str(distance) + '. Reward: ' + str(self.evaluate_policy))
             self.logger.dump(step=10)
+
+            # 每隔 save_interval 轮保存一次模型参数
+            if (r + 1) % save_interval == 0:
+                # 使用state_dict保存模型参数
+                save_path = os.path.join(log_dir, f"reward_net_state_dict_round_{r+1}.pth")
+                torch.save(self._reward_net.state_dict(), save_path)
+                print(f"Saved reward net state dict at {save_path}")
+
             if callback:
                 callback(r)
 
-        writer.close()  
+        writer.close()
 
     @property
     def policy(self) -> policies.BasePolicy:
         return self._old_policy
-    
+
     @property
     def reward_net(self) -> RewardNet:
         return self._reward_net
-    
+
     def _make_reward_train_batches(
-        self,
+            self,
     ) -> Iterator[Mapping[str, torch.Tensor]]:
         """Build and return training batches for the reward update.
 
